@@ -58,6 +58,249 @@
 
 ---
 
+# Presence Worker — Technical Deep Dive
+
+Этот документ подробно описывает внутреннее устройство `presence-worker.js` и `presence-name-resolver.js`.  
+Здесь шаг за шагом объясняется, как работает сканер активности.
+
+---
+
+## Обзор
+
+- **`presence-worker.js`**  
+  Фоновый процесс, который раз в секунду опрашивает ОС, чтобы узнать активное окно.  
+  Он классифицирует активность (игра, IDE, другое), резолвит «красивое» название приложения и отправляет события наверх.
+
+- **`presence-name-resolver.js`**  
+  Модуль для определения человекочитаемых названий. Использует кэш, библиотеки Steam/Epic, системные метаданные (Windows — `FileDescription`, macOS — `Info.plist`, Linux — `.desktop`) и эвристики.
+
+---
+
+## Data Flow
+
+```text
+ ┌─────────────┐
+ │ ОС (Windows │
+ │  macOS, Lin)│
+ └──────┬──────┘
+        │ активное окно
+        ▼
+ ┌─────────────────────┐
+ │   active-win (lib)  │
+ │   возвращает {exe,  │
+ │   title, pid, app}  │
+ └────────┬────────────┘
+          │
+          ▼
+ ┌─────────────────────────┐
+ │ presence-worker.js      │
+ │ - проверка LAUNCHER/    │
+ │   NON_GAME списков      │
+ │ - classify() → game/    │
+ │   geek/other            │
+ │ - формирование payload  │
+ └────────┬────────────────┘
+          │ exePath / name
+          ▼
+ ┌─────────────────────────┐
+ │ presence-name-resolver  │
+ │ 1. KNOWN_EXE_MAP        │
+ │ 2. cache (byExe/byPath) │
+ │ 3. Steam/Epic scan      │
+ │ 4. File metadata        │
+ │ 5. Window title         │
+ │ 6. Steam path hints     │
+ │ 7. Fallback exe name    │
+ └────────┬────────────────┘
+          │ displayName
+          ▼
+ ┌─────────────────────────┐
+ │ IPC message → parent    │
+ │   - presence:update     │
+ │   - presence:heartbeat  │
+ │   - presence:ended      │
+ │   - presence:ready      │
+ └─────────────────────────┘
+```
+
+---
+
+## Жизненный цикл воркера
+
+1. **Старт**
+   - Загружается кэш.
+   - Сканируются библиотеки Steam/Epic.
+   - Отправляется событие `presence:ready`.
+
+2. **Опрос (каждую секунду)**
+   - Получаем активное окно через `active-win`.
+   - Проверяем, не является ли процесс лаунчером или «не игрой».
+   - Классифицируем (game/geek/other).
+   - Сравниваем с предыдущей активностью.
+
+3. **События**
+   - `presence:update` — если активность новая.
+   - `presence:heartbeat` — подтверждение, что активность продолжается (раз в 5 секунд).
+   - `presence:ended` — если активность закончилась.
+
+4. **Завершение**
+   - По сигналу `shutdown` или `SIGINT/SIGTERM` останавливается опрос и воркер выходит.
+
+---
+
+## Классификация активности
+
+Функция `classify(base, fullPath)` возвращает категорию и уровень уверенности:
+
+1. Если процесс в **KNOWN_EXE_MAP** → `game (0.9)`  
+2. Если процесс в **KNOWN_GEEK_SET** → `geek (0.8)`  
+3. Если путь совпадает с **GAME_PATH_HINTS** → `game (0.6)`  
+4. Всё остальное → `other (0.3)`
+
+Лаунчеры и явные «не игры» отбрасываются.
+
+---
+
+## Резолвер имён
+
+Порядок поиска «красивого» имени:
+
+1. **Заранее известные exe** (`KNOWN_EXE_MAP`).  
+2. **Кэш** (`presence-cache.json`).  
+3. **Скан Steam/Epic** (по манифестам и путям установленных игр).  
+4. **Системные метаданные**:
+   - Windows: `FileDescription` из свойств файла.
+   - macOS: `CFBundleDisplayName` или `CFBundleName` из `Info.plist`.
+   - Linux: `Name` из `.desktop` файлов.  
+5. **Заголовок окна** (как резервный вариант).  
+6. **Эвристика Steam по пути** (`steamapps/common/...`).  
+7. **Fallback** — просто имя exe без `.exe`, с заглавной буквы.
+
+Все удачные результаты пишутся в кэш.
+
+---
+
+## События и данные
+
+### `presence:update`
+Отправляется при новой активности.
+
+Пример payload:
+```json
+{
+  "source": "active",
+  "pid": 1234,
+  "exePath": "C:\\Games\\Dota2\\game.exe",
+  "exeName": "game.exe",
+  "displayName": "Dota 2",
+  "title": "Dota 2",
+  "app": "game.exe",
+  "ts": 1710000000000,
+  "category": "game",
+  "confidence": 0.9
+}
+```
+
+### `presence:heartbeat`
+Отправляется раз в 5 секунд, если окно не менялось.
+
+### `presence:ended`
+Отправляется, если активность завершилась. Payload содержит поле `endedAt`.
+
+### `presence:ready`
+Отправляется один раз при старте.
+
+---
+
+## Кэш и хранение
+
+- Путь: `${ECHOTALK_USER_DATA || ~/.echotalk}/presence-cache.json`  
+- Хранит два словаря:  
+  - `byExe`: exe → название  
+  - `byPath`: полный путь → название  
+- Сохраняется с задержкой (500 мс), чтобы не перегружать диск.
+
+---
+
+## Интеграция
+
+Воркер запускается как дочерний процесс через `child_process.fork` и общается через IPC.
+
+Пример (родительский процесс):
+```js
+import { fork } from 'node:child_process';
+
+// Слушает события переключение тогглера из профиля пользователя
+ipcMain.on('presence-toggle', (_event, flag) => {
+      if(flag) {
+        startPresenceProc() // запускаем процесс если пользователь дал добро
+      }
+
+      if(!flag) {
+        stopPresenceProc() // глушим процесс если пользователь выключил
+      }
+
+    })
+
+// запускает вызов слушателя
+const startPresenceProc = () => {
+    presenceProc = fork(join(__dirname, 'presence-worker.js'), [], {
+      stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    });
+
+    presenceProc.on('message', (msg) => {
+      if (!msg || typeof msg !== 'object') return;
+      const { type, payload } = msg;
+
+      switch (type) {
+        case 'presence:ready':
+          return;
+
+        case 'presence:update':
+          // старт/смена активности
+          sendToRedis(payload);
+          return;
+
+        case 'presence:heartbeat':
+          // периодическое подтверждение активности
+          sendToRedis(payload);
+          return;
+
+        case 'presence:ended':
+          // явное завершение (смена окна, смерть PID, стагнация)
+          sendToRedis(payload);
+          return;
+
+        default:
+          console.log('Presence: неизвестный тип сообщения:', type);
+      }
+    });
+
+    // выключает слушатель
+    const stopPresenceProc = () => {
+    if (!presenceProc) return;
+    try { presenceProc.send({ type: 'shutdown' }); } catch {}
+    try { presenceProc.kill(); } catch {}
+    presenceProc = null;
+  };
+```
+
+---
+
+## Приватность
+
+- Сканер получает только:
+  - путь к exe;
+  - имя процесса;
+  - заголовок окна (как fallback);
+  - pid процесса.  
+- Не читаются пользовательские файлы или содержимое окон.  
+- Единственные сторонние источники: манифесты Steam/Epic (чтобы сопоставить exe с названием игры).  
+- Данные используются только локально для статуса и никуда не передаются.
+
+---
+
+
 ## Дисклеймер
 
 Этот модуль **не крадёт личные данные** и **не отправляет приватную информацию**.  
